@@ -2,7 +2,7 @@ name: Orzi SMS Notifications
 version: "2.0.0"
 slug: orzi_sms
 description: Send SMS notifications using Orzi API with templates, rate limiting, and queuing
-url: https://github.com/yourusername/orzi-sms-addon
+url: https://github.com/jjanderson/hassio-addons-orzihassio
 arch:
   - armhf
   - armv7
@@ -10,6 +10,12 @@ arch:
   - amd64
   - i386
 init: false
+build_from:
+  armhf: ghcr.io/home-assistant/armhf-base:3.19
+  armv7: ghcr.io/home-assistant/armv7-base:3.19
+  aarch64: ghcr.io/home-assistant/aarch64-base:3.19
+  amd64: ghcr.io/home-assistant/amd64-base:3.19
+  i386: ghcr.io/home-assistant/i386-base:3.19
 options:
   api_key: ""
   default_recipients: []
