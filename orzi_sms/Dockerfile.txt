@@ -1,17 +1,19 @@
-ARG BUILD_FROM
-FROM $BUILD_FROM
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.19
+FROM ${BUILD_FROM}
 
 # Install requirements
 RUN apk add --no-cache \
     python3 \
     py3-pip \
     py3-aiohttp \
-    py3-pyyaml
+    py3-yaml
 
-# Copy application
+# Copy application files
 COPY run.sh /
 COPY orzi_sms.py /
 
+# Make run script executable
 RUN chmod a+x /run.sh
 
+# Start
 CMD [ "/run.sh" ]
