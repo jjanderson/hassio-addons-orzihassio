@@ -42,4 +42,3 @@ schema:
     retry_attempts: int(1,10)?
   templates:
     match(^[a-z_]+$): str
-image: ghcr.io/{arch}-orzi-sms
