@@ -1,0 +1,45 @@
+name: Orzi SMS Notifications
+version: "2.0.0"
+slug: orzi_sms
+description: Send SMS notifications using Orzi API with templates, rate limiting, and queuing
+url: https://github.com/yourusername/orzi-sms-addon
+arch:
+  - armhf
+  - armv7
+  - aarch64
+  - amd64
+  - i386
+init: false
+options:
+  api_key: ""
+  default_recipients: []
+  log_level: info
+  rate_limit:
+    enabled: true
+    max_per_minute: 10
+    max_per_hour: 60
+  queue:
+    enabled: true
+    max_size: 100
+    retry_attempts: 3
+  templates:
+    security_alert: "ALERT: {sensor} detected at {time}"
+    temperature_alert: "Temperature is {temp}°C in {location}"
+    door_alert: "{door} was opened at {time}"
+    battery_low: "{device} battery is low: {level}%"
+schema:
+  api_key: str
+  default_recipients: 
+    - str
+  log_level: list(debug|info|warning|error)?
+  rate_limit:
+    enabled: bool?
+    max_per_minute: int(1,100)?
+    max_per_hour: int(1,1000)?
+  queue:
+    enabled: bool?
+    max_size: int(10,1000)?
+    retry_attempts: int(1,10)?
+  templates:
+    match(^[a-z_]+$): str
+image: ghcr.io/{arch}-orzi-sms

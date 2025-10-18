@@ -1,0 +1,1503 @@
+# config.yaml
+name: Orzi SMS Notifications
+version: "2.0.0"
+slug: orzi_sms
+description: Send SMS notifications using Orzi API with templates, rate limiting, and queuing
+url: https://github.com/yourusername/orzi-sms-addon
+arch:
+  - armhf
+  - armv7
+  - aarch64
+  - amd64
+  - i386
+init: false
+options:
+  api_key: ""
+  default_recipients: []
+  log_level: info
+  rate_limit:
+    enabled: true
+    max_per_minute: 10
+    max_per_hour: 60
+  queue:
+    enabled: true
+    max_size: 100
+    retry_attempts: 3
+  templates:
+    security_alert: "ALERT: {sensor} detected at {time}"
+    temperature_alert: "Temperature is {temp}°C in {location}"
+    door_alert: "{door} was opened at {time}"
+    battery_low: "{device} battery is low: {level}%"
+schema:
+  api_key: str
+  default_recipients: 
+    - str
+  log_level: list(debug|info|warning|error)?
+  rate_limit:
+    enabled: bool?
+    max_per_minute: int(1,100)?
+    max_per_hour: int(1,1000)?
+  queue:
+    enabled: bool?
+    max_size: int(10,1000)?
+    retry_attempts: int(1,10)?
+  templates:
+    match(^[a-z_]+$): str
+image: ghcr.io/{arch}-orzi-sms
+
+---
+# Dockerfile
+ARG BUILD_FROM
+FROM $BUILD_FROM
+
+# Install requirements
+RUN apk add --no-cache \
+    python3 \
+    py3-pip \
+    py3-aiohttp \
+    py3-pyyaml
+
+# Copy application
+COPY run.sh /
+COPY orzi_sms.py /
+
+RUN chmod a+x /run.sh
+
+CMD [ "/run.sh" ]
+
+---
+# run.sh
+#!/usr/bin/with-contenv bashio
+
+bashio::log.info "Starting Orzi SMS service..."
+
+# Get configuration
+API_KEY=$(bashio::config 'api_key')
+LOG_LEVEL=$(bashio::config 'log_level')
+
+# Export variables
+export API_KEY
+export LOG_LEVEL
+
+# Create config file from Home Assistant options
+python3 - << EOF
+import json
+import os
+
+config = {
+    'api_key': os.getenv('API_KEY', ''),
+    'default_recipients': $(bashio::config 'default_recipients'),
+    'rate_limit': {
+        'enabled': $(bashio::config 'rate_limit.enabled'),
+        'max_per_minute': $(bashio::config 'rate_limit.max_per_minute'),
+        'max_per_hour': $(bashio::config 'rate_limit.max_per_hour')
+    },
+    'queue': {
+        'enabled': $(bashio::config 'queue.enabled'),
+        'max_size': $(bashio::config 'queue.max_size'),
+        'retry_attempts': $(bashio::config 'queue.retry_attempts')
+    },
+    'templates': $(bashio::config 'templates')
+}
+
+with open('/data/config.json', 'w') as f:
+    json.dump(config, f)
+EOF
+
+# Start the Python service
+python3 /orzi_sms.py
+
+---
+# orzi_sms.py
+import asyncio
+import aiohttp
+import json
+import logging
+import sys
+import time
+from datetime import datetime, timedelta
+from collections import deque
+from aiohttp import web
+from typing import List, Dict, Optional
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Configuration
+ORZI_API_URL = 'https://api.orzi.app/api/SMS/Send'
+CONFIG_FILE = '/data/config.json'
+QUEUE_FILE = '/data/queue.json'
+
+class RateLimiter:
+    """Rate limiter to prevent API abuse"""
+    
+    def __init__(self, max_per_minute=10, max_per_hour=60):
+        self.max_per_minute = max_per_minute
+        self.max_per_hour = max_per_hour
+        self.minute_requests = deque()
+        self.hour_requests = deque()
+        
+    def can_send(self) -> bool:
+        """Check if we can send based on rate limits"""
+        now = time.time()
+        
+        # Clean old entries
+        minute_ago = now - 60
+        hour_ago = now - 3600
+        
+        while self.minute_requests and self.minute_requests[0] < minute_ago:
+            self.minute_requests.popleft()
+            
+        while self.hour_requests and self.hour_requests[0] < hour_ago:
+            self.hour_requests.popleft()
+            
+        # Check limits
+        if len(self.minute_requests) >= self.max_per_minute:
+            return False
+        if len(self.hour_requests) >= self.max_per_hour:
+            return False
+            
+        return True
+        
+    def record_request(self):
+        """Record a request"""
+        now = time.time()
+        self.minute_requests.append(now)
+        self.hour_requests.append(now)
+        
+    def get_wait_time(self) -> int:
+        """Get seconds to wait before next request"""
+        if not self.minute_requests and not self.hour_requests:
+            return 0
+            
+        now = time.time()
+        wait_time = 0
+        
+        if len(self.minute_requests) >= self.max_per_minute:
+            wait_time = max(wait_time, 60 - (now - self.minute_requests[0]))
+            
+        if len(self.hour_requests) >= self.max_per_hour:
+            wait_time = max(wait_time, 3600 - (now - self.hour_requests[0]))
+            
+        return int(wait_time) + 1
+
+class MessageQueue:
+    """Queue for SMS messages with retry logic"""
+    
+    def __init__(self, max_size=100, retry_attempts=3):
+        self.max_size = max_size
+        self.retry_attempts = retry_attempts
+        self.queue = deque()
+        self.processing = False
+        self.load_queue()
+        
+    def load_queue(self):
+        """Load queue from disk"""
+        try:
+            with open(QUEUE_FILE, 'r') as f:
+                data = json.load(f)
+                self.queue = deque(data)
+                logger.info(f"Loaded {len(self.queue)} messages from queue")
+        except FileNotFoundError:
+            logger.info("No existing queue file found")
+        except Exception as e:
+            logger.error(f"Error loading queue: {str(e)}")
+            
+    def save_queue(self):
+        """Save queue to disk"""
+        try:
+            with open(QUEUE_FILE, 'w') as f:
+                json.dump(list(self.queue), f)
+        except Exception as e:
+            logger.error(f"Error saving queue: {str(e)}")
+            
+    def add(self, recipients: List[str], message: str, priority: int = 0) -> bool:
+        """Add message to queue"""
+        if len(self.queue) >= self.max_size:
+            logger.warning("Queue is full, cannot add message")
+            return False
+            
+        item = {
+            'recipients': recipients,
+            'message': message,
+            'priority': priority,
+            'attempts': 0,
+            'added_at': datetime.now().isoformat()
+        }
+        
+        self.queue.append(item)
+        self.save_queue()
+        logger.info(f"Added message to queue. Queue size: {len(self.queue)}")
+        return True
+        
+    def get_next(self) -> Optional[Dict]:
+        """Get next message from queue"""
+        if not self.queue:
+            return None
+            
+        # Sort by priority (higher first)
+        sorted_queue = sorted(self.queue, key=lambda x: x['priority'], reverse=True)
+        item = sorted_queue[0]
+        self.queue.remove(item)
+        return item
+        
+    def requeue(self, item: Dict):
+        """Requeue failed message"""
+        item['attempts'] += 1
+        if item['attempts'] < self.retry_attempts:
+            self.queue.append(item)
+            self.save_queue()
+            logger.info(f"Requeued message. Attempt {item['attempts']}/{self.retry_attempts}")
+        else:
+            logger.error(f"Message failed after {self.retry_attempts} attempts. Discarding.")
+            
+    def size(self) -> int:
+        """Get queue size"""
+        return len(self.queue)
+
+class TemplateManager:
+    """Manage message templates"""
+    
+    def __init__(self, templates: Dict[str, str]):
+        self.templates = templates
+        
+    def render(self, template_name: str, **kwargs) -> Optional[str]:
+        """Render a template with provided variables"""
+        if template_name not in self.templates:
+            logger.warning(f"Template '{template_name}' not found")
+            return None
+            
+        template = self.templates[template_name]
+        
+        try:
+            # Replace placeholders
+            message = template.format(**kwargs)
+            return message
+        except KeyError as e:
+            logger.error(f"Missing variable in template: {str(e)}")
+            return None
+        except Exception as e:
+            logger.error(f"Error rendering template: {str(e)}")
+            return None
+            
+    def list_templates(self) -> List[str]:
+        """Get list of available templates"""
+        return list(self.templates.keys())
+        
+    def get_template(self, template_name: str) -> Optional[str]:
+        """Get raw template"""
+        return self.templates.get(template_name)
+
+class OrziSMSService:
+    """Main SMS service with rate limiting and queuing"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.api_key = config['api_key']
+        self.session = None
+        
+        # Initialize rate limiter
+        rate_config = config.get('rate_limit', {})
+        if rate_config.get('enabled', True):
+            self.rate_limiter = RateLimiter(
+                max_per_minute=rate_config.get('max_per_minute', 10),
+                max_per_hour=rate_config.get('max_per_hour', 60)
+            )
+        else:
+            self.rate_limiter = None
+            
+        # Initialize queue
+        queue_config = config.get('queue', {})
+        if queue_config.get('enabled', True):
+            self.queue = MessageQueue(
+                max_size=queue_config.get('max_size', 100),
+                retry_attempts=queue_config.get('retry_attempts', 3)
+            )
+        else:
+            self.queue = None
+            
+        # Initialize template manager
+        templates = config.get('templates', {})
+        self.template_manager = TemplateManager(templates)
+        
+        # Statistics
+        self.stats = {
+            'total_sent': 0,
+            'total_failed': 0,
+            'total_queued': 0,
+            'rate_limited': 0
+        }
+        
+    async def start(self):
+        """Initialize the service"""
+        self.session = aiohttp.ClientSession()
+        logger.info("Orzi SMS Service started")
+        
+        # Start queue processor
+        if self.queue:
+            asyncio.create_task(self.process_queue())
+            
+    async def stop(self):
+        """Stop the service"""
+        if self.session:
+            await self.session.close()
+        logger.info("Orzi SMS Service stopped")
+        
+    async def process_queue(self):
+        """Process queued messages"""
+        logger.info("Queue processor started")
+        
+        while True:
+            try:
+                if self.queue and self.queue.size() > 0:
+                    # Check rate limit
+                    if self.rate_limiter and not self.rate_limiter.can_send():
+                        wait_time = self.rate_limiter.get_wait_time()
+                        logger.info(f"Rate limit reached. Waiting {wait_time} seconds")
+                        await asyncio.sleep(wait_time)
+                        continue
+                        
+                    # Get next message
+                    item = self.queue.get_next()
+                    if item:
+                        logger.info("Processing queued message")
+                        result = await self._send_sms_direct(
+                            item['recipients'],
+                            item['message']
+                        )
+                        
+                        if not result['success']:
+                            self.queue.requeue(item)
+                        else:
+                            self.stats['total_sent'] += 1
+                            
+                await asyncio.sleep(5)  # Check every 5 seconds
+                
+            except Exception as e:
+                logger.error(f"Error in queue processor: {str(e)}")
+                await asyncio.sleep(10)
+                
+    async def send_sms(self, recipients: List[str], message: str, priority: int = 0, use_queue: bool = True) -> Dict:
+        """
+        Send SMS with rate limiting and queuing
+        
+        Args:
+            recipients: List of phone numbers
+            message: SMS message text
+            priority: Priority level (higher = more important)
+            use_queue: Whether to use queue if rate limited
+            
+        Returns:
+            dict: Response with success status
+        """
+        if not self.api_key:
+            return {
+                'success': False,
+                'message': 'API key not configured'
+            }
+            
+        # Ensure recipients is a list
+        if isinstance(recipients, str):
+            recipients = [recipients]
+            
+        # Check rate limit
+        if self.rate_limiter and not self.rate_limiter.can_send():
+            if use_queue and self.queue:
+                # Add to queue
+                if self.queue.add(recipients, message, priority):
+                    self.stats['total_queued'] += 1
+                    self.stats['rate_limited'] += 1
+                    return {
+                        'success': True,
+                        'message': 'Message queued due to rate limit',
+                        'queued': True,
+                        'queue_size': self.queue.size()
+                    }
+                else:
+                    return {
+                        'success': False,
+                        'message': 'Queue is full'
+                    }
+            else:
+                wait_time = self.rate_limiter.get_wait_time()
+                self.stats['rate_limited'] += 1
+                return {
+                    'success': False,
+                    'message': f'Rate limit exceeded. Wait {wait_time} seconds',
+                    'wait_time': wait_time
+                }
+                
+        # Send directly
+        result = await self._send_sms_direct(recipients, message)
+        
+        if result['success']:
+            self.stats['total_sent'] += 1
+        else:
+            self.stats['total_failed'] += 1
+            
+            # Queue on failure if enabled
+            if use_queue and self.queue:
+                self.queue.add(recipients, message, priority)
+                self.stats['total_queued'] += 1
+                result['queued'] = True
+                
+        return result
+        
+    async def _send_sms_direct(self, recipients: List[str], message: str) -> Dict:
+        """Send SMS directly to API"""
+        payload = {
+            'MobilenumberList': recipients,
+            'SMSBody': message
+        }
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'Key': self.api_key
+        }
+        
+        try:
+            logger.info(f"Sending SMS to {len(recipients)} recipient(s)")
+            
+            async with self.session.post(
+                ORZI_API_URL,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                response_text = await response.text()
+                
+                # Record rate limit
+                if self.rate_limiter:
+                    self.rate_limiter.record_request()
+                
+                if response.status >= 200 and response.status < 300:
+                    logger.info(f"SMS sent successfully: {response.status}")
+                    return {
+                        'success': True,
+                        'message': 'SMS sent successfully',
+                        'status_code': response.status,
+                        'response': response_text
+                    }
+                else:
+                    logger.error(f"API error: {response.status} - {response_text}")
+                    return {
+                        'success': False,
+                        'message': f'API error: {response.status}',
+                        'response': response_text
+                    }
+                    
+        except asyncio.TimeoutError:
+            logger.error("Request timeout")
+            return {
+                'success': False,
+                'message': 'Request timeout'
+            }
+        except Exception as e:
+            logger.error(f"Error sending SMS: {str(e)}")
+            return {
+                'success': False,
+                'message': f'Error: {str(e)}'
+            }
+
+# Load configuration
+def load_config():
+    """Load configuration from file"""
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Error loading config: {str(e)}")
+        return {
+            'api_key': '',
+            'rate_limit': {'enabled': True, 'max_per_minute': 10, 'max_per_hour': 60},
+            'queue': {'enabled': True, 'max_size': 100, 'retry_attempts': 3},
+            'templates': {}
+        }
+
+config = load_config()
+sms_service = OrziSMSService(config)
+
+# Web server handlers
+async def handle_send_sms(request):
+    """Handle SMS send requests"""
+    try:
+        data = await request.json()
+        
+        recipients = data.get('recipients', [])
+        message = data.get('message', '')
+        priority = data.get('priority', 0)
+        use_queue = data.get('use_queue', True)
+        
+        if not recipients:
+            return web.json_response({
+                'success': False,
+                'message': 'No recipients specified'
+            }, status=400)
+            
+        if not message:
+            return web.json_response({
+                'success': False,
+                'message': 'No message specified'
+            }, status=400)
+            
+        result = await sms_service.send_sms(recipients, message, priority, use_queue)
+        
+        status_code = 200 if result['success'] else 500
+        return web.json_response(result, status=status_code)
+            
+    except Exception as e:
+        logger.error(f"Error handling send request: {str(e)}")
+        return web.json_response({
+            'success': False,
+            'message': str(e)
+        }, status=500)
+
+async def handle_send_template(request):
+    """Handle template-based SMS requests"""
+    try:
+        data = await request.json()
+        
+        recipients = data.get('recipients', [])
+        template_name = data.get('template', '')
+        variables = data.get('variables', {})
+        priority = data.get('priority', 0)
+        
+        if not recipients:
+            return web.json_response({
+                'success': False,
+                'message': 'No recipients specified'
+            }, status=400)
+            
+        if not template_name:
+            return web.json_response({
+                'success': False,
+                'message': 'No template specified'
+            }, status=400)
+            
+        # Render template
+        message = sms_service.template_manager.render(template_name, **variables)
+        
+        if not message:
+            return web.json_response({
+                'success': False,
+                'message': f'Template "{template_name}" not found or invalid'
+            }, status=400)
+            
+        result = await sms_service.send_sms(recipients, message, priority)
+        
+        status_code = 200 if result['success'] else 500
+        return web.json_response(result, status=status_code)
+            
+    except Exception as e:
+        logger.error(f"Error handling template request: {str(e)}")
+        return web.json_response({
+            'success': False,
+            'message': str(e)
+        }, status=500)
+
+async def handle_list_templates(request):
+    """List available templates"""
+    templates = {}
+    for name in sms_service.template_manager.list_templates():
+        templates[name] = sms_service.template_manager.get_template(name)
+        
+    return web.json_response({
+        'success': True,
+        'templates': templates
+    })
+
+async def handle_queue_status(request):
+    """Get queue status"""
+    if not sms_service.queue:
+        return web.json_response({
+            'enabled': False,
+            'message': 'Queue is disabled'
+        })
+        
+    return web.json_response({
+        'enabled': True,
+        'size': sms_service.queue.size(),
+        'max_size': sms_service.queue.max_size,
+        'retry_attempts': sms_service.queue.retry_attempts
+    })
+
+async def handle_stats(request):
+    """Get service statistics"""
+    stats = sms_service.stats.copy()
+    
+    if sms_service.queue:
+        stats['queue_size'] = sms_service.queue.size()
+        
+    if sms_service.rate_limiter:
+        stats['rate_limit_enabled'] = True
+        stats['can_send_now'] = sms_service.rate_limiter.can_send()
+        stats['wait_time'] = sms_service.rate_limiter.get_wait_time()
+    else:
+        stats['rate_limit_enabled'] = False
+        
+    return web.json_response({
+        'success': True,
+        'stats': stats
+    })
+
+async def handle_health(request):
+    """Health check endpoint"""
+    return web.json_response({
+        'status': 'healthy',
+        'service': 'Orzi SMS',
+        'version': '2.0.0'
+    })
+
+async def init_app():
+    """Initialize the web application"""
+    app = web.Application()
+    
+    # Routes
+    app.router.add_post('/send', handle_send_sms)
+    app.router.add_post('/send_template', handle_send_template)
+    app.router.add_get('/templates', handle_list_templates)
+    app.router.add_get('/queue', handle_queue_status)
+    app.router.add_get('/stats', handle_stats)
+    app.router.add_get('/health', handle_health)
+    
+    await sms_service.start()
+    
+    return app
+
+async def cleanup(app):
+    """Cleanup on shutdown"""
+    await sms_service.stop()
+
+if __name__ == '__main__':
+    if not config.get('api_key'):
+        logger.error("API_KEY not configured!")
+        sys.exit(1)
+        
+    logger.info("Starting Orzi SMS addon v2.0.0...")
+    
+    app = asyncio.run(init_app())
+    app.on_cleanup.append(cleanup)
+    
+    web.run_app(app, host='0.0.0.0', port=8099)
+
+---
+# README.md
+# Orzi SMS Home Assistant Addon v2.0
+
+Send SMS notifications using the Orzi API with advanced features including message templates, rate limiting, and message queuing.
+
+## 🚀 New Features
+
+### Message Templates
+Create reusable message templates with variables for common notifications.
+
+### Rate Limiting
+Prevent API abuse with configurable rate limits (per minute and per hour).
+
+### Message Queuing
+Automatic queuing when rate limits are reached, with retry logic for failed messages.
+
+## Installation
+
+1. Add this repository to your Home Assistant Add-on Store
+2. Install the "Orzi SMS Notifications" addon
+3. Configure your settings
+4. Start the addon
+
+## Configuration
+
+```yaml
+api_key: "your-orzi-api-key-here"
+default_recipients:
+  - "447829999999"
+  - "447829999990"
+log_level: info
+rate_limit:
+  enabled: true
+  max_per_minute: 10
+  max_per_hour: 60
+queue:
+  enabled: true
+  max_size: 100
+  retry_attempts: 3
+templates:
+  security_alert: "ALERT: {sensor} detected at {time}"
+  temperature_alert: "Temperature is {temp}°C in {location}"
+  door_alert: "{door} was opened at {time}"
+  battery_low: "{device} battery is low: {level}%"
+```
+
+### Configuration Options
+
+#### Rate Limiting
+- `enabled`: Enable/disable rate limiting
+- `max_per_minute`: Maximum SMS per minute (1-100)
+- `max_per_hour`: Maximum SMS per hour (1-1000)
+
+#### Queue
+- `enabled`: Enable/disable message queuing
+- `max_size`: Maximum queue size (10-1000)
+- `retry_attempts`: Number of retry attempts for failed messages (1-10)
+
+#### Templates
+Custom message templates with variable placeholders using `{variable}` syntax.
+
+## Usage in Home Assistant
+
+### Method 1: REST Command (Standard Messages)
+
+Add to `configuration.yaml`:
+
+```yaml
+rest_command:
+  send_orzi_sms:
+    url: http://localhost:8099/send
+    method: POST
+    content_type: 'application/json'
+    payload: >
+      {
+        "recipients": {{ recipients | tojson }},
+        "message": "{{ message }}",
+        "priority": {{ priority | default(0) }},
+        "use_queue": {{ use_queue | default(true) }}
+      }
+```
+
+### Method 2: REST Command (Template Messages)
+
+```yaml
+rest_command:
+  send_orzi_template:
+    url: http://localhost:8099/send_template
+    method: POST
+    content_type: 'application/json'
+    payload: >
+      {
+        "recipients": {{ recipients | tojson }},
+        "template": "{{ template }}",
+        "variables": {{ variables | tojson }},
+        "priority": {{ priority | default(0) }}
+      }
+```
+
+## Examples
+
+### Using Standard Messages
+
+```yaml
+automation:
+  - alias: "Motion Detected"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.motion_sensor
+        to: 'on'
+    action:
+      - service: rest_command.send_orzi_sms
+        data:
+          recipients: ["447829999999"]
+          message: "Motion detected in {{ trigger.to_state.attributes.friendly_name }}"
+          priority: 5
+```
+
+### Using Templates
+
+```yaml
+automation:
+  - alias: "Security Alert with Template"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.motion_sensor
+        to: 'on'
+    action:
+      - service: rest_command.send_orzi_template
+        data:
+          recipients: ["447829999999", "447829999990"]
+          template: "security_alert"
+          variables:
+            sensor: "Motion Sensor"
+            time: "{{ now().strftime('%H:%M:%S') }}"
+          priority: 10
+
+  - alias: "Temperature Alert with Template"
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.living_room_temperature
+        above: 30
+    action:
+      - service: rest_command.send_orzi_template
+        data:
+          recipients: ["447829999999"]
+          template: "temperature_alert"
+          variables:
+            temp: "{{ states('sensor.living_room_temperature') }}"
+            location: "Living Room"
+
+  - alias: "Door Alert with Template"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.front_door
+        to: 'on'
+    action:
+      - service: rest_command.send_orzi_template
+        data:
+          recipients: ["447829999999"]
+          template: "door_alert"
+          variables:
+            door: "Front Door"
+            time: "{{ now().strftime('%I:%M %p') }}"
+
+  - alias: "Battery Low with Template"
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.phone_battery
+        below: 20
+    action:
+      - service: rest_command.send_orzi_template
+        data:
+          recipients: ["447829999999"]
+          template: "battery_low"
+          variables:
+            device: "Phone"
+            level: "{{ states('sensor.phone_battery') }}"
+```
+
+### High Priority Messages
+
+```yaml
+automation:
+  - alias: "Critical Security Breach"
+    trigger:
+      - platform: state
+        entity_id: alarm_control_panel.home_alarm
+        to: 'triggered'
+    action:
+      - service: rest_command.send_orzi_sms
+        data:
+          recipients: ["447829999999", "447829999990"]
+          message: "CRITICAL: Home alarm triggered!"
+          priority: 100  # High priority - sent first
+          use_queue: false  # Don't queue, fail if rate limited
+```
+
+## API Endpoints
+
+### POST /send
+Send a standard SMS message
+
+**Request:**
+```json
+{
+  "recipients": ["447829999999", "447829999990"],
+  "message": "Your SMS message",
+  "priority": 5,
+  "use_queue": true
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "SMS sent successfully",
+  "status_code": 200
+}
+```
+
+**Queued Response:**
+```json
+{
+  "success": true,
+  "message": "Message queued due to rate limit",
+  "queued": true,
+  "queue_size": 3
+}
+```
+
+### POST /send_template
+Send SMS using a template
+
+**Request:**
+```json
+{
+  "recipients": ["447829999999"],
+  "template": "security_alert",
+  "variables": {
+    "sensor": "Motion Sensor",
+    "time": "14:30:00"
+  },
+  "priority": 10
+}
+```
+
+### GET /templates
+List all available templates
+
+**Response:**
+```json
+{
+  "success": true,
+  "templates": {
+    "security_alert": "ALERT: {sensor} detected at {time}",
+    "temperature_alert": "Temperature is {temp}°C in {location}"
+  }
+}
+```
+
+### GET /queue
+Get queue status
+
+**Response:**
+```json
+{
+  "enabled": true,
+  "size": 5,
+  "max_size": 100,
+  "retry_attempts": 3
+}
+```
+
+### GET /stats
+Get service statistics
+
+**Response:**
+```json
+{
+  "success": true,
+  "stats": {
+    "total_sent": 150,
+    "total_failed": 5,
+    "total_queued": 20,
+    "rate_limited": 10,
+    "queue_size": 3,
+    "rate_limit_enabled": true,
+    "can_send_now": true,
+    "wait_time": 0
+  }
+}
+```
+
+### GET /health
+Health check
+
+**Response:**
+```json
+{
+  "status": "healthy",
+  "service": "Orzi SMS",
+  "version": "2.0.0"
+}
+```
+
+## Advanced Features
+
+### Priority System
+- Higher priority messages are sent first from the queue
+- Priority range: 0-100 (0 = normal, 100 = critical)
+- Use high priority for security alerts and critical notifications
+
+### Rate Limiting
+- Automatically prevents exceeding API limits
+- Configurable per-minute and per-hour limits
+- Messages are queued when rate limit is reached
+- Automatic retry after cooldown period
+
+### Message Queue
+- Persistent queue (survives restarts)
+- Automatic retry on failure
+- Configurable retry attempts
+- FIFO with priority support
+- Maximum queue size protection
+
+### Template System
+- Reusable message templates
+- Variable substitution with `{variable}` syntax
+- Easy to manage in addon configuration
+- Reduces automation complexity
+
+## Monitoring
+
+### View Statistics
+
+Create a sensor in Home Assistant:
+
+```yaml
+sensor:
+  - platform: rest
+    name: Orzi SMS Stats
+    resource: http://localhost:8099/stats
+    value_template: "{{ value_json.stats.total_sent }}"
+    json_attributes:
+      - stats
+    scan_interval: 60
+```
+
+Display in Lovelace:
+
+```yaml
+type: entities
+title: Orzi SMS Statistics
+entities:
+  - entity: sensor.orzi_sms_stats
+    name: Total Sent
+  - type: attribute
+    entity: sensor.orzi_sms_stats
+    attribute: stats.total_failed
+    name: Total Failed
+  - type: attribute
+    entity: sensor.orzi_sms_stats
+    attribute: stats.queue_size
+    name: Queue Size
+  - type: attribute
+    entity: sensor.orzi_sms_stats
+    attribute: stats.rate_limited
+    name: Rate Limited Count
+```
+
+### Queue Monitoring
+
+```yaml
+sensor:
+  - platform: rest
+    name: Orzi SMS Queue
+    resource: http://localhost:8099/queue
+    value_template: "{{ value_json.size }}"
+    json_attributes:
+      - enabled
+      - size
+      - max_size
+    scan_interval: 30
+```
+
+Alert when queue is full:
+
+```yaml
+automation:
+  - alias: "SMS Queue Full Alert"
+    trigger:
+      - platform: template
+        value_template: "{{ state_attr('sensor.orzi_sms_queue', 'size') >= state_attr('sensor.orzi_sms_queue', 'max_size') * 0.9 }}"
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "Orzi SMS Queue Nearly Full"
+          message: "SMS queue is at {{ state_attr('sensor.orzi_sms_queue', 'size') }}/{{ state_attr('sensor.orzi_sms_queue', 'max_size') }}"
+```
+
+## Best Practices
+
+### 1. Use Templates for Repeated Messages
+Instead of duplicating message text across automations, create templates:
+
+```yaml
+# In addon config
+templates:
+  generic_alert: "Home Assistant Alert: {message} at {time}"
+  
+# In automation
+action:
+  - service: rest_command.send_orzi_template
+    data:
+      template: "generic_alert"
+      variables:
+        message: "Motion detected"
+        time: "{{ now().strftime('%H:%M') }}"
+```
+
+### 2. Set Appropriate Priorities
+- **Priority 0-3**: Informational (weather, reminders)
+- **Priority 4-6**: Normal alerts (door opened, lights on)
+- **Priority 7-9**: Important (temperature warnings, battery low)
+- **Priority 10+**: Critical (security breach, smoke detector)
+
+### 3. Use Queue for Non-Critical Messages
+```yaml
+# Critical - don't queue
+action:
+  - service: rest_command.send_orzi_sms
+    data:
+      message: "SECURITY ALERT!"
+      use_queue: false
+      priority: 100
+
+# Non-critical - allow queuing
+action:
+  - service: rest_command.send_orzi_sms
+    data:
+      message: "Daily summary"
+      use_queue: true
+      priority: 1
+```
+
+### 4. Configure Rate Limits Based on Usage
+```yaml
+# High usage
+rate_limit:
+  max_per_minute: 20
+  max_per_hour: 100
+
+# Low usage
+rate_limit:
+  max_per_minute: 5
+  max_per_hour: 30
+```
+
+### 5. Monitor Queue and Stats
+Set up sensors and alerts to monitor service health and prevent issues.
+
+## Troubleshooting
+
+### Check Addon Logs
+Go to the addon page and click "Log" tab. Look for:
+- `SMS sent successfully` - Message sent
+- `Message queued` - Added to queue
+- `Rate limit reached` - Too many requests
+- `API error` - Check API key and network
+
+### Test Endpoints
+
+**Test Send:**
+```bash
+curl -X POST http://localhost:8099/send \
+  -H "Content-Type: application/json" \
+  -d '{"recipients":["447829999999"],"message":"Test"}'
+```
+
+**Test Template:**
+```bash
+curl -X POST http://localhost:8099/send_template \
+  -H "Content-Type: application/json" \
+  -d '{"recipients":["447829999999"],"template":"security_alert","variables":{"sensor":"Test","time":"now"}}'
+```
+
+**Check Stats:**
+```bash
+curl http://localhost:8099/stats
+```
+
+**Check Queue:**
+```bash
+curl http://localhost:8099/queue
+```
+
+**List Templates:**
+```bash
+curl http://localhost:8099/templates
+```
+
+### Common Issues
+
+**1. "API key not configured"**
+- Check addon configuration
+- Ensure API key is correct
+- Restart addon after changing config
+
+**2. "Rate limit exceeded"**
+- Messages are being queued automatically
+- Check queue status with `/queue` endpoint
+- Increase rate limits if needed
+- Messages will send automatically when limit resets
+
+**3. "Queue is full"**
+- Too many failed messages
+- Check API connectivity
+- Clear queue by restarting addon
+- Increase `max_size` in queue config
+
+**4. "Template not found"**
+- Check template name spelling
+- List templates with `/templates` endpoint
+- Add template to addon configuration
+
+**5. Messages not sending**
+- Check addon is running
+- Verify API key is valid
+- Check network connectivity
+- Review addon logs for errors
+
+### Reset Queue
+If queue has issues, you can reset it:
+
+1. Stop the addon
+2. Delete `/data/queue.json` in addon data folder
+3. Start the addon
+
+## Example Complete Configuration
+
+```yaml
+# Home Assistant configuration.yaml
+rest_command:
+  send_orzi_sms:
+    url: http://localhost:8099/send
+    method: POST
+    content_type: 'application/json'
+    payload: >
+      {
+        "recipients": {{ recipients | tojson }},
+        "message": "{{ message }}",
+        "priority": {{ priority | default(5) }},
+        "use_queue": {{ use_queue | default(true) }}
+      }
+      
+  send_orzi_template:
+    url: http://localhost:8099/send_template
+    method: POST
+    content_type: 'application/json'
+    payload: >
+      {
+        "recipients": {{ recipients | tojson }},
+        "template": "{{ template }}",
+        "variables": {{ variables | tojson }},
+        "priority": {{ priority | default(5) }}
+      }
+
+sensor:
+  - platform: rest
+    name: Orzi SMS Stats
+    resource: http://localhost:8099/stats
+    value_template: "{{ value_json.stats.total_sent }}"
+    json_attributes:
+      - stats
+    scan_interval: 60
+    
+  - platform: rest
+    name: Orzi SMS Queue
+    resource: http://localhost:8099/queue
+    value_template: "{{ value_json.size }}"
+    json_attributes_path: "$"
+    json_attributes:
+      - enabled
+      - size
+      - max_size
+    scan_interval: 30
+
+automation:
+  # Security alerts (high priority, no queue)
+  - alias: "Security Breach"
+    trigger:
+      - platform: state
+        entity_id: alarm_control_panel.home_alarm
+        to: 'triggered'
+    action:
+      - service: rest_command.send_orzi_template
+        data:
+          recipients: ["447829999999", "447829999990"]
+          template: "security_alert"
+          variables:
+            sensor: "Alarm System"
+            time: "{{ now().strftime('%H:%M:%S') }}"
+          priority: 100
+          
+  # Temperature monitoring (normal priority)
+  - alias: "Temperature Warning"
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.temperature
+        above: 30
+    action:
+      - service: rest_command.send_orzi_template
+        data:
+          recipients: ["447829999999"]
+          template: "temperature_alert"
+          variables:
+            temp: "{{ states('sensor.temperature') }}"
+            location: "Living Room"
+          priority: 7
+          
+  # Daily summary (low priority)
+  - alias: "Morning Summary"
+    trigger:
+      - platform: time
+        at: "08:00:00"
+    action:
+      - service: rest_command.send_orzi_sms
+        data:
+          recipients: ["447829999999"]
+          message: "Good morning! Temp: {{ states('sensor.temperature') }}°C"
+          priority: 2
+```
+
+## Advanced Automation Examples
+
+### Conditional Priority Based on Time
+
+```yaml
+automation:
+  - alias: "Smart Door Alert"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.front_door
+        to: 'on'
+    action:
+      - service: rest_command.send_orzi_template
+        data:
+          recipients: ["447829999999"]
+          template: "door_alert"
+          variables:
+            door: "Front Door"
+            time: "{{ now().strftime('%I:%M %p') }}"
+          priority: >
+            {% if now().hour >= 22 or now().hour <= 6 %}
+              10
+            {% else %}
+              5
+            {% endif %}
+```
+
+### Escalating Alerts
+
+```yaml
+automation:
+  - alias: "Water Leak Detection"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.water_leak
+        to: 'on'
+    action:
+      # First alert
+      - service: rest_command.send_orzi_sms
+        data:
+          recipients: ["447829999999"]
+          message: "WATER LEAK DETECTED!"
+          priority: 50
+      
+      # Wait 5 minutes
+      - delay: '00:05:00'
+      
+      # Check if still leaking
+      - condition: state
+        entity_id: binary_sensor.water_leak
+        state: 'on'
+        
+      # Escalated alert
+      - service: rest_command.send_orzi_sms
+        data:
+          recipients: ["447829999999", "447829999990"]
+          message: "URGENT: Water leak still active after 5 minutes!"
+          priority: 100
+          use_queue: false
+```
+
+### Multiple Recipients Based on Condition
+
+```yaml
+automation:
+  - alias: "Smart Temperature Alert"
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.temperature
+        above: 30
+    action:
+      - service: rest_command.send_orzi_template
+        data:
+          recipients: >
+            {% if states('sensor.temperature') | float > 35 %}
+              ["447829999999", "447829999990", "447829999991"]
+            {% else %}
+              ["447829999999"]
+            {% endif %}
+          template: "temperature_alert"
+          variables:
+            temp: "{{ states('sensor.temperature') }}"
+            location: "Server Room"
+          priority: >
+            {% if states('sensor.temperature') | float > 35 %}
+              20
+            {% else %}
+              10
+            {% endif %}
+```
+
+## Performance Tips
+
+1. **Queue Size**: Set based on your message volume
+   - Low volume: 50-100
+   - Medium volume: 100-200
+   - High volume: 200-500
+
+2. **Rate Limits**: Balance between responsiveness and API limits
+   - Start with defaults (10/min, 60/hour)
+   - Adjust based on actual usage
+
+3. **Retry Attempts**: More attempts = more resilient but slower
+   - Critical messages: 1-2 attempts
+   - Normal messages: 3-5 attempts
+
+4. **Log Level**: Use `info` in production, `debug` for troubleshooting
+
+## Support
+
+For issues, questions, or feature requests:
+- Check the addon logs first
+- Test endpoints manually
+- Review Home Assistant logs
+- Consult the troubleshooting section
+
+## Changelog
+
+### v2.0.0
+- Added message templates
+- Added rate limiting
+- Added message queuing with retry logic
+- Added priority system
+- Added statistics endpoint
+- Improved error handling
+- Persistent queue across restarts
+
+### v1.0.0
+- Initial release
+- Basic SMS sending
+- REST API endpoints
+
+---
+# apparmor.txt
+#include <tunables/global>
+
+profile orzi_sms flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # Capabilities
+  capability net_raw,
+  capability net_admin,
+  
+  # S6-Overlay
+  /init ix,
+  /bin/** ix,
+  /usr/bin/** ix,
+  /run/{s6,s6-rc*,service}/** ix,
+  /package/** ix,
+  /command/** ix,
+  /etc/services.d/** rwix,
+  /etc/cont-init.d/** rwix,
+  /etc/cont-finish.d/** rwix,
+  /run/{,**} rwk,
+  /dev/tty rw,
+
+  # Bashio
+  /usr/lib/bashio/** ix,
+  /tmp/** rwk,
+
+  # Access to options.json and other service settings
+  /data/** rw,
+
+  # Python
+  /usr/bin/python3* ix,
+  /usr/lib/python3*/** rix,
+
+  # Application files
+  /orzi_sms.py r,
+  /run.sh r,
+
+  # SSL certificates
+  /etc/ssl/openssl.cnf r,
+  /etc/ssl/certs/ca-certificates.crt r,
+
+  # Network access
+  network inet stream,
+  network inet6 stream,
+  network inet dgram,
+  network inet6 dgram,
+}

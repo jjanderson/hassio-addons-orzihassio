@@ -1,0 +1,17 @@
+ARG BUILD_FROM
+FROM $BUILD_FROM
+
+# Install requirements
+RUN apk add --no-cache \
+    python3 \
+    py3-pip \
+    py3-aiohttp \
+    py3-pyyaml
+
+# Copy application
+COPY run.sh /
+COPY orzi_sms.py /
+
+RUN chmod a+x /run.sh
+
+CMD [ "/run.sh" ]
